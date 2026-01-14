@@ -22,6 +22,15 @@ RESULT_TIE = 3
 
 
 def build_deck():
+    """
+    Build and shuffle a standard 52-card deck.
+
+    Cards are represented as (rank, suit) tuples,
+    where rank is 1-13 and suit is 0-3.
+
+    Returns:
+        list[tuple[int, int]]: Shuffled deck of cards.
+    """
     # ranks 1..13, suits 0..3
     deck = [(r, s) for r in range(1, 14) for s in range(4)]
     random.shuffle(deck)
@@ -29,6 +38,18 @@ def build_deck():
 
 
 def card_value(rank: int) -> int:
+    """
+    Convert a card rank to its Blackjack value.
+
+    Ace is initially counted as 11.
+    Face cards (J, Q, K) are counted as 10.
+
+    Args:
+        rank (int): Card rank (1-13).
+
+    Returns:
+        int: Blackjack value of the card.
+    """
     if rank == 1:
         return 11
     if 2 <= rank <= 10:
@@ -37,6 +58,18 @@ def card_value(rank: int) -> int:
 
 
 def adjust_for_aces(total: int, ace_count: int) -> int:
+    """
+    Adjust hand total by converting Aces from 11 to 1 if needed.
+
+    Prevents busting when total exceeds 21.
+
+    Args:
+        total (int): Current hand total.
+        ace_count (int): Number of Aces counted as 11.
+
+    Returns:
+        int: Adjusted hand total.
+    """
     while total > 21 and ace_count > 0:
         total -= 10
         ace_count -= 1
@@ -44,6 +77,22 @@ def adjust_for_aces(total: int, ace_count: int) -> int:
 
 
 def recv_exact(conn: socket.socket, n: int) -> bytes:
+    """
+    Receive exactly n bytes from a TCP connection.
+
+    TCP may return fewer bytes than requested in a single recv call,
+    so this function loops until all bytes are received.
+
+    Args:
+        conn (socket.socket): Connected TCP socket.
+        n (int): Number of bytes to receive.
+
+    Returns:
+        bytes: Exactly n bytes.
+
+    Raises:
+        ConnectionError: If the client disconnects prematurely.
+    """
     data = b""
     while len(data) < n:
         chunk = conn.recv(n - len(data))
@@ -54,6 +103,21 @@ def recv_exact(conn: socket.socket, n: int) -> bytes:
 
 
 def read_request(conn: socket.socket):
+    """
+    Read and parse the initial join request from the client.
+
+    The request contains the protocol cookie, message type,
+    number of rounds, and client name.
+
+    Args:
+        conn (socket.socket): Connected TCP socket.
+
+    Returns:
+        tuple[int, str]: (rounds, player_name)
+
+    Raises:
+        ValueError: If the request header is invalid.
+    """
     # request + \n
     fmt = "!IbB32s"
     size = struct.calcsize(fmt)
@@ -69,6 +133,22 @@ def read_request(conn: socket.socket):
 
 
 def read_client_decision(conn: socket.socket, timeout_sec: float = 10.0) -> bytes:
+    """
+    Read a Hit or Stand decision from the client.
+
+    The decision is received as a fixed-size payload
+    and validated against the protocol.
+
+    Args:
+        conn (socket.socket): Connected TCP socket.
+        timeout_sec (float): Timeout in seconds.
+
+    Returns:
+        bytes: Client decision (b'Hittt' or b'Stand').
+
+    Raises:
+        ValueError: If the payload is invalid.
+    """
     """Return 5-byte decision payload: b'Hittt' or b'Stand'"""
     fmt = "!Ib5s"
     size = struct.calcsize(fmt)
@@ -89,11 +169,33 @@ def read_client_decision(conn: socket.socket, timeout_sec: float = 10.0) -> byte
 
 
 def send_payload(conn: socket.socket, result: int, rank: int, suit: int):
+    """
+    Send a payload message to the client.
+
+    Payloads include the current game result
+    and card information.
+
+    Args:
+        conn (socket.socket): Connected TCP socket.
+        result (int): Game result code.
+        rank (int): Card rank.
+        suit (int): Card suit.
+    """
     fmt = "!IbBHB"
     conn.sendall(struct.pack(fmt, PAYLOAD_COOKIE, PAYLOAD_TYPE, result, rank, suit))
 
 
 def broadcast_offers(server_tcp_port: int, server_name: str, stop_event: threading.Event):
+    """
+    Broadcast server offers periodically using UDP.
+
+    Continues broadcasting until stop_event is set.
+
+    Args:
+        server_tcp_port (int): TCP port of the server.
+        server_name (str): Name of the server.
+        stop_event (threading.Event): Event to stop broadcasting.
+    """
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
@@ -109,16 +211,29 @@ def broadcast_offers(server_tcp_port: int, server_name: str, stop_event: threadi
 
 
 def play_round(conn: socket.socket):
+    """
+    Play a single round of Blackjack with a connected client.
+
+    Handles dealing cards, player decisions,
+    dealer logic, and determining the final result.
+
+    Args:
+        conn (socket.socket): Connected TCP socket.
+
+    Returns:
+        int: Final result code of the round.
+    """
     deck = build_deck()
 
     def draw():
+        # Draw the top card from the deck
         return deck.pop()
 
     # player & dealer hands
     player = [draw(), draw()]
     dealer = [draw(), draw()]  # dealer[1] is hidden initially
 
-    # totals tracking with aces
+    # calculate hand total with ace adjustment
     def hand_total(hand):
         total = 0
         aces = 0
@@ -128,7 +243,7 @@ def play_round(conn: socket.socket):
                 aces += 1
         return adjust_for_aces(total, aces)
 
-    # send 2 player cards, then dealer up-card
+    # send initial cards: 2 player cards and 1 dealer up-card
     send_payload(conn, RESULT_NOT_OVER, player[0][0], player[0][1])
     send_payload(conn, RESULT_NOT_OVER, player[1][0], player[1][1])
     send_payload(conn, RESULT_NOT_OVER, dealer[0][0], dealer[0][1])
@@ -137,14 +252,12 @@ def play_round(conn: socket.socket):
     while True:
         pt = hand_total(player)
         if pt > 21:
-            # bust should be caught earlier usually, but safe anyway
             return RESULT_LOSS
 
         decision = read_client_decision(conn, timeout_sec=10.0)
         if decision == b"Stand":
             break
 
-        # Hit
         card = draw()
         player.append(card)
         pt = hand_total(player)
@@ -154,24 +267,19 @@ def play_round(conn: socket.socket):
         else:
             send_payload(conn, RESULT_NOT_OVER, card[0], card[1])
 
-    # dealer turn: reveal hidden
+    # dealer turn: reveal hidden card
     send_payload(conn, RESULT_NOT_OVER, dealer[1][0], dealer[1][1])
 
-    # hit until >= 17
+    # dealer hits until reaching at least 17
     while hand_total(dealer) < 17:
         card = draw()
         dealer.append(card)
         send_payload(conn, RESULT_NOT_OVER, card[0], card[1])
 
-    # decide winner
     pt = hand_total(player)
     dt = hand_total(dealer)
 
     if dt > 21:
-        # dealer bust: send a final payload (no extra card here; we need to end round cleanly)
-        # We'll end by sending one "dummy" card? Better: end on last dealer card already sent.
-        # So: just return WIN; client will see final on last dealer card? Not yet.
-        # To keep protocol identical to your approach, we send a final payload with last dealer card and result.
         last = dealer[-1]
         send_payload(conn, RESULT_WIN, last[0], last[1])
         return RESULT_WIN
@@ -191,6 +299,16 @@ def play_round(conn: socket.socket):
 
 
 def handle_client(conn: socket.socket, addr):
+    """
+    Handle a single client connection.
+
+    Reads the join request and runs the requested
+    number of game rounds.
+
+    Args:
+        conn (socket.socket): Client TCP socket.
+        addr (tuple): Client address.
+    """
     try:
         rounds, name = read_request(conn)
         print(f"Player connected: {name} from {addr}, rounds={rounds}")
@@ -205,6 +323,12 @@ def handle_client(conn: socket.socket, addr):
 
 
 def main():
+    """
+    Main entry point for the Blackjack server.
+
+    Sets up the TCP server, broadcasts offers via UDP,
+    and spawns a new thread for each connected client.
+    """
     server_name = "BlackjackServer"
 
     tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -214,13 +338,21 @@ def main():
     print(f"Server listening on TCP port {server_tcp_port}")
 
     stop_event = threading.Event()
-    t = threading.Thread(target=broadcast_offers, args=(server_tcp_port, server_name, stop_event), daemon=True)
+    t = threading.Thread(
+        target=broadcast_offers,
+        args=(server_tcp_port, server_name, stop_event),
+        daemon=True
+    )
     t.start()
 
     try:
         while True:
             conn, addr = tcp.accept()
-            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+            threading.Thread(
+                target=handle_client,
+                args=(conn, addr),
+                daemon=True
+            ).start()
     finally:
         stop_event.set()
         tcp.close()
